@@ -338,7 +338,9 @@ EOP
 
 [ -n "$o_crit" ] || [ -n "$o_warn" ] && {
   command -v dumpasn1 >/dev/null || nag_unkn "dumpasn1 utility missing"
-  expdate=$(dumpasn1 -a "$fn_resp" 2>/dev/null | grep UTCTime | head -n 2 | tail -n 1 | \
+  expdate=$(openssl ts -reply -in "$fn_resp" -token_out 2>/dev/null | \
+    openssl cms -verify -inform DER -noverify -out /dev/null -signer /dev/stdout 2>/dev/null | \
+    openssl x509 -outform DER | dumpasn1 -a - 2>/dev/null | grep UTCTime | head -n 2 | tail -n 1 | \
     perl -pe 's,.*UTCTime (\d{2})/(\d{2})/(\d{4}) (\d+):(\d{2}):(\d{2}).*,\3-\2-\1 \4:\5:\6 UTC,')
 
   t_now=$(date -u +'%s')
