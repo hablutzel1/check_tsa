@@ -1,0 +1,49 @@
+2015-12-17  Michal Bozon  <michal.bozon@gmail.com>
+
+  * Version 0.6 :
+  Changes in the timestamp data output format.
+  Added -w / -c (warning/critical) options to check TSA cert expiration date.
+  Added -i option to specify the input document for the timestamp,
+  default input data is no longer generated randomly, but is empty (/dev/null).
+  Added -4 and -6 options to force IPv4 or IPv6.
+  More verbosity levels available (up to -vvvv).
+  Default timeout decreased to 3 seconds.
+  Default hash algorithm changed to sha256.
+  Optimizations in the timestamp data parsing code.
+
+2014-08-15  Michal Bozon  <michal.bozon@cesnet.cz>
+
+  * Version 0.5 :
+  Fixed programming error, which could cause incorrect
+  response timestamp token time accuracy reporting.
+
+2014-06-17  Michal Bozon  <michal.bozon@cesnet.cz>
+
+  * Version 0.4 :
+  Added -v (verbosity) option to include timestamp 
+  data info in the output.
+
+  Fixed output text layout when TSA verification failure.
+
+2013-12-12  Michal Bozon  <michal.bozon@cesnet.cz>
+
+  * Version 0.3 :
+  Fixed internal timeout variables programming error.
+
+
+2013-12-10  Michal Bozon  <michal.bozon@cesnet.cz>
+
+  * Version 0.2 :
+  First public release.
+
+  Fixed buggy network error reporting.
+  Fixed unknown arguments handling.
+  Port numbers must be really numerical.
+  Missing openssl ts command is reported properly.
+  Some more little fixes.
+
+
+2013-10-31  Michal Bozon  <michal.bozon@cesnet.cz>
+
+  * Version 0.1 :
+  Initial release.

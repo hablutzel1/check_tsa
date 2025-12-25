@@ -1,0 +1,372 @@
+#! /bin/sh
+#
+# check_tsa: Nagios/Icinga plugin to check RFC3161 TSA timestamps.
+#
+# AUTHORS
+#   Michal Bozon <michal.bozon@gmail.com>
+#
+# COPYRIGHT
+#   Copyright (C) 2013-2015 CESNET
+#   
+#   This program is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation, either version 3 of the License, or
+#   (at your option) any later version.
+#   
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#   
+#   You should have received a copy of the GNU General Public License
+#   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# DEPENDENCIES
+#   curl, openssl, grep, perl, date (GNU)
+# 
+
+PROGNAME="check_tsa"
+VERSION="0.6"
+
+# defaults
+o_proto="http"
+o_path="/"
+o_hashalgo=sha256
+timeout=3
+verbosity=0
+
+USAGE=`cat <<EOU
+Usage: $PROGNAME    -H host -p port -P path  [OPTIONS..]
+   or               -u TSA_URL               [OPTIONS..]
+
+general options:
+  -h                show this help
+  -v                increase verbosity
+  -V                show version
+
+  -w days           TSA certificate expiration warning (implies -C)
+  -c days           TSA certificate expiration critical (implies -C)
+                    (if -w/-c options are not provided, upcoming certificate
+                     expiration is not checked)
+
+TSA query Options:
+  -p port           port number (default: default service protocol port)
+  -P path           HTTP request path (default: $o_path)
+  -s protocol       protocol (scheme) (default: $o_proto)
+  -t seconds        timeout (default: $timeout)
+                    if not provided, DEFAULT_SOCKET_TIMEOUT applies, if available
+
+  -a sha1|sha256|.. message digest (hash) algorithm (default: $o_hashalgo)
+  -i filename       use file as input document (if not provided, empty file is used)
+  -C                include certificate request in the query
+  -O OID            request policy
+
+  -4                resolve hostname to IPv4 address
+  -6                resolve hostname to IPv6 address
+
+verification options:
+  -b filename       CA certificate file/bundle (openssl CAfile)
+  -d dirname        CA certificate directory (openssl CApath)
+  -x filename       TSA certificate
+
+other options:
+  -Q filename       save TSA query
+  -R filename       save TSA response
+EOU
+`
+
+usage () {
+  [ "$1" ] && {
+    echo "Error: $1"
+    echo
+  }
+  echo "$USAGE"
+  [ "$1" ] && exit 3
+}
+
+tempdir="/tmp"
+_progname=$0
+
+err () {
+  echo "${_progname}: $*"
+  exit 3
+}
+
+_nag_exit () {
+  case $1 in
+    0) _s="OK";;
+    1) _s="WARNING";;
+    2) _s="CRITICAL";;
+    3) _s="UNKNOWN";;
+  esac
+  echo "TSA ${_s}: $2"
+  cleanup
+  exit $1
+}
+
+nag_ok ()   { _nag_exit 0 "$@"; }
+nag_warn () { _nag_exit 1 "$@"; }
+nag_crit () { _nag_exit 2 "$@"; }
+nag_unkn () { _nag_exit 3 "$@"; }
+
+ispositivenum () {
+  [ "$1" -eq "$1" ] 2>/dev/null && [ $1 -gt 0 ]
+}
+
+singlelineize () {
+  echo "$*" | perl -pe 'if (!eof) { chomp; $_.="; "}'
+}
+
+
+cleanup(){ :; } # no-operation for now - nothing to cleanup
+
+while getopts a:b:c:Cd:hH:i:O:p:P:Q:R:s:t:u:vVw:x:46 _opt; do
+  case $_opt in
+    a) o_hashalgo=$OPTARG ;;
+
+    b) o_cafile=$OPTARG
+       [ -f "$o_cafile" ] || err "$o_cafile is not a file"
+       ossl_v_addopts="$ossl_v_addopts -CAfile $o_cafile"
+       ;;
+
+    c) ispositivenum $OPTARG && o_crit=$OPTARG || err "invalid -c option value" ;;
+
+    C) o_certreq=1 ;;
+
+    d) o_capath=$OPTARG
+       [ -d "$o_capath" ] || err "$o_capath is not a directory"
+       ossl_v_addopts="$ossl_v_addopts -CApath $o_capath"
+       ;;
+
+    h) usage; exit 0 ;;
+
+    H) o_host=$OPTARG ;;
+
+    i) o_input=$OPTARG ;;
+
+    O) o_policy=$OPTARG; ossl_q_addopts="$ossl_q_addopts -policy $o_policy" ;;
+
+    p) ispositivenum $OPTARG && o_port=$OPTARG || err "invalid -p option value" ;;
+
+    P) o_path=$OPTARG ;;
+
+    Q) o_queryfile=$OPTARG ;;
+
+    R) o_respfile=$OPTARG ;;
+
+    s) o_proto=$OPTARG ;;
+
+    t) o_timeout=$OPTARG ;;
+
+    u) o_url=$OPTARG;;
+
+    v) verbosity=$((verbosity+1)) ;;
+
+    V) echo "$PROGNAME/$VERSION"; exit 0 ;;
+
+    w) ispositivenum $OPTARG && o_warn=$OPTARG || err "invalid -w option value" ;;
+
+    x) o_tsacertfile=$OPTARG
+       [ -f "$o_tsacertfile" ] || nag_unkn "$o_tsacertfile is not a file"
+       ossl_v_addopts="$ossl_v_addopts -untrusted $o_tsacertfile"
+       ;;
+
+    4) curl_addopts="$curl_addopts -4" ;; # TODO check conflict
+    6) curl_addopts="$curl_addopts -6" ;;
+
+    \?) usage; exit 3 ;;
+    # \?)     echo $USAGE; exit 1;;
+  esac
+done 2>&1 # (put possible getopts error messages to stdout)
+shift `expr $OPTIND - 1`
+
+[ "$#" -gt 0 ] && usage "Unrecognized argument(s): $*"
+[ -z "$o_url" ] && [ -z "$o_host" ] && usage "No TSA URL or host specified."
+[ -n "$o_url" ] && [ -n "$o_host" ] && usage "Host (-H) and URL (-u) options are conflicting"
+[ -n "$o_url" ] && url=$o_url
+[ -n "$o_host" ] && {
+  loc=$o_host
+  [ -n "$o_port" ] && loc="$loc:$o_port"
+  url="$o_proto://$loc/${o_path##/}"
+}
+[ -n "${o_input+x}" ] && { [ -e "$o_input" ] || err "File $o_input not found." ; }
+[ -n "$o_certreq" ] || [ -n "$o_warn" ] || [ -n "$o_crit" ] && ossl_q_addopts="$ossl_q_addopts -cert"
+[ "$verbosity" -gt 2 ] && curl_addopts="$curl_addopts --verbose"
+
+stamp=`date -u +%Y%m%d%H%M%S%NZ`
+_desc=$(echo "$url" | sed 's/[^a-zA-Z0-9_-]/_/g')
+name=".check_tsa-$stamp-$_desc"
+fn_noext="$tempdir/$name"
+fn_ossltserr="${fn_noext}.ossltserr"
+fn_req="${fn_noext}.tsq"
+fn_resp="${fn_noext}.tsr"
+fn_curlerr="${fn_noext}.curlerr"
+
+cleanup () {
+  rm -f "$fn_noext"* >/dev/null 2>&1
+}
+trap "cleanup" EXIT HUP INT QUIT TERM
+
+[ -n "$DEFAULT_SOCKET_TIMEOUT" ] && timeout="$DEFAULT_SOCKET_TIMEOUT"
+[ -n "$o_timeout" ] && timeout=$o_timeout
+
+# Prepare the TSQ file
+[ -n "$o_input" ] && {
+  cat "$o_input" | openssl ts -query -$o_hashalgo -out "$fn_req" $ossl_q_addopts 2> "$fn_ossltserr"
+} || {
+  # -i option was not provided
+  openssl ts -query -$o_hashalgo -out "$fn_req" $ossl_q_addopts 2> "$fn_ossltserr" < /dev/null
+ 
+}
+r_osslts=$?
+
+# OpenSSL (<=1.0.1e, at least) exists with status 0 when invalid command is used,
+# so we have to detect it by looking at the error output :/
+[ -f "$fn_ossltserr" ] && {
+  grep -q "is an invalid command" "$fn_ossltserr" && \
+    err "This OpenSSL version does not know 'ts' command."
+}
+
+[ "$r_osslts" = 0 ] || {
+  err "could not generate TS query data (openssl ts command failed)"
+}
+
+[ "$o_queryfile" ] && [ -f "$fn_req" ] && cp "$fn_req" "$o_queryfile"
+
+
+# Send the TSQ, get TSR
+out_curl=$(curl \
+  -s -S \
+  -m "$timeout" \
+  -H "Content-Type: application/timestamp-query" \
+  -A "$PROGNAME/$VERSION" \
+  -w '%{http_code} %{content_type}\n' \
+  --data-binary @"$fn_req" \
+  -o "$fn_resp" \
+  -L "$url" \
+  $curl_addopts
+  2>"$fn_curlerr")
+
+r_curl=$?
+
+[ "$o_respfile" ] && [ -f "$fn_resp" ] && cp "$fn_resp" "$o_respfile"
+
+[ "$r_curl" = 0 ] || {
+  curlerr2=$(cat $fn_curlerr | sed -r 's/^curl:\s*\([0-9]+\)\s*//')
+  nag_unkn "$url network failure: $curlerr2"
+}
+
+http_status=${out_curl%% *}
+content_type=${out_curl#* }
+
+[ "$http_status" = 200 ] && {
+  [ "$content_type" = "application/timestamp-reply" ] || {
+    [ "$content_type" = "application/timestamp-response" ] && {
+      nag_warn "$url content-type should be application/timestamp-reply, is $content_type"
+    } || {
+    nag_crit "$url Unexpected content-type \"$content_type\" (wrong TSA URL?)"
+    }
+  }
+} || {
+  nag_unkn "$url HTTP response code ${http_status}"
+}
+
+out_ts=$(openssl ts -verify -queryfile "$fn_req" -in "$fn_resp" $ossl_v_addopts 2>&1)
+r_ts=$?
+
+[ $verbosity -lt 2 ] && out_ts=$(singlelineize $out_ts)
+
+# Get and reinterpret the TSR data
+[ $verbosity -gt 0 ] && $(echo $out_ts | grep -qv 'status code: reject') && {
+  ts_info=$(openssl ts -reply -in "$fn_resp" -text)
+  r_ts_info=$?
+  [ $verbosity -eq 1 ] && {
+    perlscript1="$(cat <<'EOP'
+      $verbosity = $ARGV[0];
+      @inp = <STDIN>;
+      for (@inp) {
+        $a = $1 if /^hash algorithm:\s*(.*)/i;
+        $s = $1 if /^serial number:\s*(.*)/i;
+        $t = $1 if /^time stamp:\s*(.*)/i;
+        $o = 1  if /^ordering:\s*yes/i;
+        $acc = $1 if /^accuracy:\s*(.*)/i;
+        $p = $1 if /^policy oid:\s*(.*)/i;
+        $n = $1 if /^tsa:\s*(.*)/i;
+        $mdblk = 0 if ($mdblk && /^\S/);  # multiline message data block ended
+        if ($mdblk) { /^\s+\d+\s+-\s+([0-9a-fA-F -]{47})/; $h_=$1; $h_=~s/[ -]//g; $h.=$h_ }
+        $mdblk = 1 if /^message data:/i;
+      }
+      %mon = qw(Jan 1 Feb 2 Mar 3 Apr 4 May 5 Jun 6 Jul 7 Aug 8 Sep 9 Oct 10 Nov 11 Dec 12);
+      $t = sprintf("%s-%02i-%02i %02i:%02i:%s UTC", $6, $mon{$1}||$1, $2, $3, $4, $5)
+        if $t =~ /([a-z]{3})\s+(\d+)\s+(\d+):(\d+):(\d+(?:\.\d+)?)\s+(\d+)\s*(?:gmt|utc)/i;
+      $n =~ s/^dirname:\s*//i;
+      $asraw =  $1 if $acc =~ /(0x[0-9A-Fa-f]+|[0-9]+)\s+seconds/;
+      $amsraw = $1 if $acc =~ /(0x[0-9A-Fa-f]+|[0-9]+)\s+millis/;
+      $ausraw = $1 if $acc =~ /(0x[0-9A-Fa-f]+|[0-9]+)\s+micros/;
+      $as  = $asraw =~  /^0x/ ? hex($asraw) :  0+$asraw;
+      $ams = $amsraw =~ /^0x/ ? hex($amsraw) : 0+$amsraw;
+      $aus = $ausraw =~ /^0x/ ? hex($ausraw) : 0+$ausraw;
+      $AMS = 1000 * $as + $ams + $aus/1000;
+      # $ASEC = $as + $ams/1000 + $aus/1000000;
+      # $T = $ASEC ? $t." +/- $ASEC UTC": $t;
+      # $T .= " (ordering)" if $o;
+      # push @O, $T, $n, $a, $s, $p;
+      # push @O, "name:\"$n\"", "time:$T", "hash:$a:$h", "sn:$s", "oid:$p";
+      if ($verbosity == 1) {
+        push @O, "tsa:\"$n\"", "time:\"$t\"", "sn:$s", "policy:$p";
+        print join(" ", grep(/.+/, @O));
+      };
+      if ($verbosity >= 2) {
+        push @O,
+          "tsa: $n",
+          "time: $t",
+          "accuracy: ${AMS}ms",
+          "serial: $s",
+          "policy: $p",
+          "hash: $h",
+          "hash algo: $a";
+        print join("\n", grep(/.+/, @O));
+      }
+EOP
+    )"
+    out_ts_info=$(echo "$ts_info" | perl -e "$perlscript1" $verbosity)
+  } || {
+    # verbosity >= 2 , use the original openssl ts TSR output
+    out_ts_info=$ts_info
+  }
+}
+
+[ -n "$o_crit" ] || [ -n "$o_warn" ] && {
+  command -v dumpasn1 >/dev/null || nag_unkn "dumpasn1 utility missing"
+  expdate=$(dumpasn1 -a "$fn_resp" 2>/dev/null | grep UTCTime | head -n 2 | tail -n 1 | \
+    perl -pe 's,.*UTCTime (\d{2})/(\d{2})/(\d{4}) (\d+):(\d{2}):(\d{2}).*,\3-\2-\1 \4:\5:\6 UTC,')
+
+  t_now=$(date -u +'%s')
+  t_exp=$(date -u +'%s' --date="$expdate")
+
+  exp_days=$(( (t_exp - t_now) / (3600*24) ))
+
+  [ "$t_exp" -lt "$t_now" ] && {
+    expmsg_='has expired!'
+  } || {
+    expmsg_="expires in $exp_days days"
+  }
+
+  expmsg="TSA certificate ${expmsg_} ($expdate) $out_ts_info"
+
+  [ -n "$o_crit" ] && [ "$exp_days" -lt "$o_crit" ] && nag_crit "$expmsg"
+  [ -n "$o_warn" ] && [ "$exp_days" -lt "$o_warn" ] && nag_warn "$expmsg"
+}
+
+[ "$r_ts" = 0 ] && {
+  out="$url TSR verified"
+  [ $verbosity -eq 1 ] && out="$out; $out_ts_info"
+  [ $verbosity -gt 1 ] && out=$(echo -e "$out\n$out_ts_info")
+  nag_ok "$out"
+} || {
+  out="$url TSR verification failed"
+  [ $verbosity -eq 0 ] && out="$out; error: $out_ts"
+  [ $verbosity -eq 1 ] && out="$out; error: $out_ts; $out_ts_info"
+  [ $verbosity -gt 1 ] && out=$(echo -e "$out\n$out_ts\n$out_ts_info")
+  nag_crit "$out"
+}
